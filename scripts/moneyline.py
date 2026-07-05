@@ -157,21 +157,36 @@ def crypto_universe():
         j = get("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=170&page=1", backoff=4)
         coins = [((m["symbol"] or "").upper(), m["name"]) for m in j]
         print(f"universe via CoinGecko: {len(coins)} candidates")
+    import re as _re
     seen, out = set(), []
     for sym, name in coins:
+        if not _re.fullmatch(r"[A-Z0-9]{1,10}", sym): continue   # junk / non-latin tickers
         if sym.lower() in EXCLUDE or sym in seen: continue
         seen.add(sym); out.append((sym, name))
         if len(out) >= TOP_COINS: break
     return out
 
+# data-api.binance.vision = Binance's official public-data mirror (not geo-blocked,
+# unlike api.binance.com which returns 451 from US-hosted GitHub runners)
+BINANCE_BASES = ["https://data-api.binance.vision", "https://api.binance.com"]
+
+def binance_get(path):
+    last = None
+    for base in BINANCE_BASES:
+        try:
+            return get(base + path, tries=2)
+        except Exception as e:
+            last = e
+    raise last
+
 def binance_symbols():
     try:
-        return {t["symbol"] for t in get("https://api.binance.com/api/v3/ticker/price")}
+        return {t["symbol"] for t in binance_get("/api/v3/ticker/price")}
     except Exception as e:
         print("Binance symbol list failed:", e); return set()
 
 def binance_klines(sym, iv, limit):
-    j = get(f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={iv}&limit={limit}")
+    j = binance_get(f"/api/v3/klines?symbol={sym}&interval={iv}&limit={limit}")
     return [dict(t=k[0], o=float(k[1]), h=float(k[2]), l=float(k[3]), c=float(k[4])) for k in j]
 
 def gecko_id_map(symbols):
@@ -275,6 +290,7 @@ def main():
     gmap = gecko_id_map(set(non_bin)) if non_bin else {}
     print(f"crypto: {len(universe)} coins ({len(universe)-len(non_bin)} on Binance)")
 
+    gecko_fails = 0
     for sym, name in universe:
         entry = dict(kind="crypto", sym=sym, name=name, tf={})
         try:
@@ -287,6 +303,8 @@ def main():
                     time.sleep(0.15)
                 entry["src"] = "binance"
             elif sym in gmap:
+                if gecko_fails >= 6:
+                    raise Exception("skipped — CoinGecko persistently rate limited this run")
                 daily, hourly = gecko_candles(gmap[sym])
                 live = daily[-1]["c"] if daily else None
                 for tf, cands in (("1w", weekly_from_daily(daily)), ("1d", daily), ("4h", agg(hourly, TFS["4h"]))):
@@ -298,7 +316,10 @@ def main():
                 entry["err"] = "no data source"
         except Exception as e:
             entry["err"] = str(e)[:120]
-        if entry["tf"]: assets.append(entry)
+            if "rate limited" in entry["err"]: gecko_fails += 1
+        if entry["tf"]:
+            assets.append(entry)
+            if entry.get("src") == "coingecko": gecko_fails = 0
         elif entry.get("err"): print(f"  crypto {sym}: {entry['err']}")
 
     # ── stocks ──
@@ -350,8 +371,11 @@ def main():
     flog_path = DOCS / "flips.json"
     flog = []
     if flog_path.exists():
-        try: flog = json.loads(flog_path.read_text())
-        except Exception: pass
+        try:
+            flog = json.loads(flog_path.read_text())
+            if not isinstance(flog, list): flog = []
+        except Exception:
+            flog = []
     flog = (flips[::-1] + flog)[:500]
     flog_path.write_text(json.dumps(flog))
 
